@@ -188,10 +188,18 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
 
     for (i, token) in enumerate(example.doc_tokens):
       orig_to_tok_index.append(len(all_doc_tokens))
+      # TODO:
+      token = token.replace("QQQQQQ", "%Q")
+      token = token.replace("%%DOCUMENT%%", "%D")
+      token = token.replace("%%PARAGRAPH%%", "%P")
+      token = token.replace("%%PARAGRAPH_GROUP%%", "%G")
+      sub_tokens = tokenizer.tokenize(token)
+      """
       if not token in set(["%%DOCUMENT%%", "%%PARAGRAPH%%", "%%PARAGRAPH_GROUP%%"]):
         sub_tokens = tokenizer.tokenize(token)
       else:
         sub_tokens = []
+      """
       for sub_token in sub_tokens:
         tok_to_orig_index.append(i)
         all_doc_tokens.append(sub_token)
