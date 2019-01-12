@@ -77,31 +77,9 @@ flags.DEFINE_integer("save_checkpoints_steps", 1000,
 flags.DEFINE_integer("iterations_per_loop", 1000,
                      "How many steps to make in each estimator call.")
 
-flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
-
-tf.flags.DEFINE_string(
-    "tpu_name", None,
-    "The Cloud TPU to use for training. This should be either the name "
-    "used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 "
-    "url.")
-
-tf.flags.DEFINE_string(
-    "tpu_zone", None,
-    "[Optional] GCE zone where the Cloud TPU is located in. If not "
-    "specified, we will attempt to automatically detect the GCE project from "
-    "metadata.")
-
-tf.flags.DEFINE_string(
-    "gcp_project", None,
-    "[Optional] Project name for the Cloud TPU-enabled project. If not "
-    "specified, we will attempt to automatically detect the GCE project from "
-    "metadata.")
-
-tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
-
 flags.DEFINE_integer(
-    "num_tpu_cores", 8,
-    "Only used if `use_tpu` is True. Total number of TPU cores to use.")
+    "num_gpus", 4,
+    "Total number of GPU cores to use.")
 
 flags.DEFINE_bool(
     "verbose_logging", False,
@@ -385,7 +363,7 @@ def create_model(bert_config, is_training, input_ids_list, input_mask_list,
 
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
-                     num_train_steps, num_warmup_steps, use_tpu,
+                     num_train_steps, num_warmup_steps,
                      use_one_hot_embeddings):
   """Returns `model_fn` closure for TPUEstimator."""
 
@@ -418,15 +396,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     if init_checkpoint:
       (assignment_map, initialized_variable_names
       ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-      if use_tpu:
-
-        def tpu_scaffold():
-          tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-          return tf.train.Scaffold()
-
-        scaffold_fn = tpu_scaffold
-      else:
-        tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+      tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
     tf.logging.info("**** Trainable Variables ****")
     for var in tvars:
@@ -445,7 +415,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
             positions, depth=seq_length, dtype=tf.float32)
         b = tf.expand_dims(weights, -1)
         c = tf.multiply(a, b)
-        d = tf.reduce_sum(c, 1) / tf.expand_dims(tf.reduce_sum(weights, -1), -1) # TODO:
+        d = tf.reduce_sum(c, 1) # / tf.expand_dims(tf.reduce_sum(weights, -1), -1) # TODO:
         log_probs = tf.nn.log_softmax(logits, axis=-1)
         loss = -tf.reduce_mean(
             tf.reduce_sum(d * log_probs, axis=-1))
@@ -460,20 +430,20 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
       total_loss = (start_loss + end_loss) / 2.0
 
       train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+          total_loss, learning_rate, num_train_steps, num_warmup_steps)
 
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      output_spec = tf.estimator.EstimatorSpec(
           mode=mode,
           loss=total_loss,
           train_op=train_op,
-          scaffold_fn=scaffold_fn)
+          scaffold=scaffold_fn)
     elif mode == tf.estimator.ModeKeys.PREDICT:
       predictions = {
           "unique_ids": unique_ids,
           "start_logits": start_logits,
           "end_logits": end_logits,
       }
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      output_spec = tf.estimator.EstimatorSpec(
           mode=mode, predictions=predictions, scaffold_fn=scaffold_fn)
     else:
       raise ValueError(
@@ -485,7 +455,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
 
 def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
-  """Creates an `input_fn` closure to be passed to TPUEstimator."""
+  """Creates an `input_fn` closure to be passed to Estimator."""
 
   name_to_features = {
       "unique_ids": tf.FixedLenFeature([], tf.int64),
@@ -517,6 +487,9 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
     """The actual input function."""
     batch_size = params["batch_size"]
 
+    print("!!!")
+    print("batch_size: ", batch_size)
+
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
     d = tf.data.TFRecordDataset(input_file)
@@ -529,6 +502,7 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
             lambda record: _decode_record(record, name_to_features),
             batch_size=batch_size,
             drop_remainder=drop_remainder))
+    d = d.prefetch(4)
 
     return d
 
@@ -613,21 +587,16 @@ def main(_):
   tokenizer = tokenization.FullTokenizer(
       vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
 
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+  dist_trategy = tf.contrib.distribute.MirroredStrategy(
+      num_gpus=int(FLAGS.num_gpus),
+      cross_tower_ops=tf.contrib.distribute.AllReduceCrossTowerOps(
+          'nccl', num_packs=int(FLAGS.num_gpus)))
 
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
+  run_config = tf.estimator.RunConfig(
+      train_distribute=dist_trategy,
+      eval_distribute=dist_trategy,
       model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+      save_checkpoints_steps=FLAGS.save_checkpoints_steps)
 
   train_examples = None
   num_train_steps = None
@@ -636,7 +605,7 @@ def main(_):
   train_examples = read_open_qa_examples(
       inputfile=FLAGS.train_file, is_training=True)
   num_train_steps = int(
-      len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
+      len(train_examples) / FLAGS.train_batch_size / FLAGS.num_gpus * FLAGS.num_train_epochs)
   num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
   # Pre-shuffle the input to avoid having to make a very large shuffle
@@ -650,17 +619,16 @@ def main(_):
       learning_rate=FLAGS.learning_rate,
       num_train_steps=num_train_steps,
       num_warmup_steps=num_warmup_steps,
-      use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+      use_one_hot_embeddings=False)
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
+  estimator = tf.estimator.Estimator(
       model_fn=model_fn,
       config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      predict_batch_size=FLAGS.predict_batch_size)
+      params={
+          "batch_size":FLAGS.train_batch_size,
+      })
 
   filename = os.path.join(FLAGS.output_dir, "train.tf_record")
   if True: # not os.path.exists(filename):
