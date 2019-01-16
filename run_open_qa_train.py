@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import time
 import modeling
 import optimization
 import tokenization
@@ -37,6 +38,10 @@ flags.DEFINE_string(
     "json file path for training. E.g., train_output.json")
 
 flags.DEFINE_string(
+    "eval_file", None,
+    "json file path for training. E.g., dev_output.json")
+
+flags.DEFINE_string(
     "init_checkpoint", None,
     "Initial checkpoint (usually from a pre-trained BERT model).")
 
@@ -63,8 +68,8 @@ flags.DEFINE_integer("predict_batch_size", 2,
 
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
-flags.DEFINE_float("num_train_epochs", 30.0,
-                   "Total number of training epochs to perform.")
+flags.DEFINE_integer("num_train_epochs", 30,
+                     "Total number of training epochs to perform.")
 
 flags.DEFINE_float(
     "warmup_proportion", 0.1,
@@ -74,34 +79,14 @@ flags.DEFINE_float(
 flags.DEFINE_integer("save_checkpoints_steps", 1000,
                      "How often to save the model checkpoint.")
 
-flags.DEFINE_integer("iterations_per_loop", 1000,
-                     "How many steps to make in each estimator call.")
+flags.DEFINE_integer("eval_steps", 1000,
+                     "How often to run evaluation.")
 
-flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
+flags.DEFINE_integer("log_steps", 200,
+                     "How often to run evaluation.")
 
-tf.flags.DEFINE_string(
-    "tpu_name", None,
-    "The Cloud TPU to use for training. This should be either the name "
-    "used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 "
-    "url.")
-
-tf.flags.DEFINE_string(
-    "tpu_zone", None,
-    "[Optional] GCE zone where the Cloud TPU is located in. If not "
-    "specified, we will attempt to automatically detect the GCE project from "
-    "metadata.")
-
-tf.flags.DEFINE_string(
-    "gcp_project", None,
-    "[Optional] Project name for the Cloud TPU-enabled project. If not "
-    "specified, we will attempt to automatically detect the GCE project from "
-    "metadata.")
-
-tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
-
-flags.DEFINE_integer(
-    "num_tpu_cores", 8,
-    "Only used if `use_tpu` is True. Total number of TPU cores to use.")
+flags.DEFINE_integer("num_gpus", 1,
+                     "How many gpus to use.")
 
 flags.DEFINE_bool(
     "verbose_logging", False,
@@ -384,102 +369,132 @@ def create_model(bert_config, is_training, input_ids_list, input_mask_list,
   return (start_logits, end_logits)
 
 
+def average_gradients(tower_grads):
+  average_grads = []
+  tvars = []
+  for grad_and_vars in zip(*tower_grads):
+    # Note that each grad_and_vars looks like the following:
+    #   ((grad0_gpu0, var0_gpu0), ... , (grad0_gpuN, var0_gpuN))
+    grads = []
+
+    if grad_and_vars[0][0] == None:
+      print(grad_and_vars[0][1], "grads: None")
+      grad = None
+    else:
+      for g, _ in grad_and_vars:
+        # Add 0 dimension to the gradients to represent the tower.
+        expanded_g = tf.expand_dims(g, 0)
+
+        # Append on a 'tower' dimension which we will average over below.
+        grads.append(expanded_g)
+
+      # Average over the 'tower' dimension.
+      grad = tf.concat(axis=0, values=grads)
+      grad = tf.reduce_mean(grad, 0)
+
+    # Keep in mind that the Variables are redundant because they are shared
+    # across towers. So .. we will just return the first tower's pointer to
+    # the Variable.
+    v = grad_and_vars[0][1]
+    average_grads.append(grad)
+    tvars.append(v)
+  return average_grads, tvars
+
+
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
-                     num_train_steps, num_warmup_steps, use_tpu,
-                     use_one_hot_embeddings):
+                     num_train_steps, num_warmup_steps, num_gpus, is_training):
   """Returns `model_fn` closure for TPUEstimator."""
 
-  def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
+  def model_fn(input_data):  # pylint: disable=unused-argument
     """The `model_fn` for TPUEstimator."""
 
-    tf.logging.info("*** Features ***")
-    for name in sorted(features.keys()):
-      tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
+    optimizer, global_step = optimization.create_optimizer(
+        learning_rate, num_train_steps, num_warmup_steps)
 
-    unique_ids = features["unique_ids"]
-    input_ids_list = features["input_ids_list"]
-    input_mask_list = features["input_mask_list"]
-    segment_ids_list = features["segment_ids_list"]
+    tower_grads = []
+    losses = []
+    with tf.variable_scope(tf.get_variable_scope(), reuse=tf.AUTO_REUSE):
+      for i in range(num_gpus):
+        with tf.device('/gpu:%d' % i):
+          with tf.name_scope('%s_%d' % ("tower", i)) as scope:
+            features = input_data.get_next()
 
-    is_training = (mode == tf.estimator.ModeKeys.TRAIN)
+            tf.logging.info("*** Features ***")
+            for name in sorted(features.keys()):
+              tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
 
-    (start_logits, end_logits) = create_model(
-        bert_config=bert_config,
-        is_training=is_training,
-        input_ids_list=input_ids_list,
-        input_mask_list=input_mask_list,
-        segment_ids_list=segment_ids_list,
-        use_one_hot_embeddings=use_one_hot_embeddings)
+            unique_ids = features["unique_ids"]
+            input_ids_list = features["input_ids_list"]
+            input_mask_list = features["input_mask_list"]
+            segment_ids_list = features["segment_ids_list"]
 
-    tvars = tf.trainable_variables()
+            (start_logits, end_logits) = create_model(
+                bert_config=bert_config,
+                is_training=is_training,
+                input_ids_list=input_ids_list,
+                input_mask_list=input_mask_list,
+                segment_ids_list=segment_ids_list,
+                use_one_hot_embeddings=False)
 
-    initialized_variable_names = {}
-    scaffold_fn = None
-    if init_checkpoint:
-      (assignment_map, initialized_variable_names
-      ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-      if use_tpu:
+            tvars = tf.trainable_variables()
 
-        def tpu_scaffold():
-          tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-          return tf.train.Scaffold()
+            initialized_variable_names = {}
+            if init_checkpoint:
+              (assignment_map, initialized_variable_names) = \
+                  modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+              tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
-        scaffold_fn = tpu_scaffold
-      else:
-        tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+            tf.logging.info("**** Trainable Variables ****")
+            for var in tvars:
+              init_string = ""
+              if var.name in initialized_variable_names:
+                init_string = ", *INIT_FROM_CKPT*"
+              tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
+                              init_string)
 
-    tf.logging.info("**** Trainable Variables ****")
-    for var in tvars:
-      init_string = ""
-      if var.name in initialized_variable_names:
-        init_string = ", *INIT_FROM_CKPT*"
-      tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-                      init_string)
+            seq_length = modeling.get_shape_list(input_ids_list)[1]
 
-    output_spec = None
-    if mode == tf.estimator.ModeKeys.TRAIN:
-      seq_length = modeling.get_shape_list(input_ids_list)[1]
+            def compute_loss(logits, positions, weights):
+              a = tf.one_hot(
+                  positions, depth=seq_length, dtype=tf.float32)
+              b = tf.expand_dims(weights, -1)
+              c = tf.multiply(a, b)
+              d = tf.reduce_sum(c, 1) / tf.expand_dims(tf.reduce_sum(weights, -1), -1) # TODO:
+              log_probs = tf.nn.log_softmax(logits, axis=-1)
+              loss = -tf.reduce_mean(
+                  tf.reduce_sum(d * log_probs, axis=-1))
+              return loss
 
-      def compute_loss(logits, positions, weights):
-        a = tf.one_hot(
-            positions, depth=seq_length, dtype=tf.float32)
-        b = tf.expand_dims(weights, -1)
-        c = tf.multiply(a, b)
-        d = tf.reduce_sum(c, 1) / tf.expand_dims(tf.reduce_sum(weights, -1), -1) # TODO:
-        log_probs = tf.nn.log_softmax(logits, axis=-1)
-        loss = -tf.reduce_mean(
-            tf.reduce_sum(d * log_probs, axis=-1))
-        return loss
+            start_positions = features["start_positions"]
+            end_positions = features["end_positions"]
+            weights = tf.cast(features["weights"], tf.float32)
 
-      start_positions = features["start_positions"]
-      end_positions = features["end_positions"]
-      weights = tf.cast(features["weights"], tf.float32)
+            start_loss = compute_loss(start_logits, start_positions, weights)
+            end_loss = compute_loss(end_logits, end_positions, weights)
+            total_loss = (start_loss + end_loss) / 2.0
 
-      start_loss = compute_loss(start_logits, start_positions, weights)
-      end_loss = compute_loss(end_logits, end_positions, weights)
-      total_loss = (start_loss + end_loss) / 2.0
+            losses.append(total_loss)
 
-      train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+            # Calculate the gradients for the batch of data on this CIFAR tower.
 
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          train_op=train_op,
-          scaffold_fn=scaffold_fn)
-    elif mode == tf.estimator.ModeKeys.PREDICT:
-      predictions = {
-          "unique_ids": unique_ids,
-          "start_logits": start_logits,
-          "end_logits": end_logits,
-      }
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode, predictions=predictions, scaffold_fn=scaffold_fn)
-    else:
-      raise ValueError(
-          "Only TRAIN and PREDICT modes are supported: %s" % (mode))
+            tvars = tf.trainable_variables()
+            grads = tf.gradients(total_loss, tvars)
+            grads_and_tvars = [(g, v) for g, v in zip(grads, tvars)]
 
-    return output_spec
+            # Keep track of the gradients across all towers.
+            tower_grads.append(grads_and_tvars)
+
+      # average gradients 
+      average_grads, tvars = average_gradients(tower_grads)
+
+      (grads, _) = tf.clip_by_global_norm(average_grads, clip_norm=1.0)
+      train_op = optimizer.apply_gradients(
+          zip(grads, tvars), global_step=global_step)
+
+      new_global_step = global_step + 1
+      train_op = tf.group(train_op, [global_step.assign(new_global_step)])
+
+    return train_op, tf.reduce_mean(losses)
 
   return model_fn
 
@@ -494,10 +509,9 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
       "segment_ids_list": tf.FixedLenFeature([NUM_DOCS * seq_length], tf.int64),
   }
 
-  if is_training:
-    name_to_features["start_positions"] = tf.FixedLenFeature([NUM_ANSWER_SPANS], tf.int64)
-    name_to_features["end_positions"] = tf.FixedLenFeature([NUM_ANSWER_SPANS], tf.int64)
-    name_to_features["weights"] = tf.FixedLenFeature([NUM_ANSWER_SPANS], tf.int64)
+  name_to_features["start_positions"] = tf.FixedLenFeature([NUM_ANSWER_SPANS], tf.int64)
+  name_to_features["end_positions"] = tf.FixedLenFeature([NUM_ANSWER_SPANS], tf.int64)
+  name_to_features["weights"] = tf.FixedLenFeature([NUM_ANSWER_SPANS], tf.int64)
 
   def _decode_record(record, name_to_features):
     """Decodes a record to a TensorFlow example."""
@@ -516,12 +530,13 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
   def input_fn(params):
     """The actual input function."""
     batch_size = params["batch_size"]
+    num_gpus = params["num_gpus"]
 
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
     d = tf.data.TFRecordDataset(input_file)
+    d = d.repeat()
     if is_training:
-      d = d.repeat()
       d = d.shuffle(buffer_size=100)
 
     d = d.apply(
@@ -529,6 +544,7 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
             lambda record: _decode_record(record, name_to_features),
             batch_size=batch_size,
             drop_remainder=drop_remainder))
+    d = d.prefetch(num_gpus)
 
     return d
 
@@ -589,6 +605,10 @@ def validate_flags_or_throw(bert_config):
     raise ValueError(
         "`train_file` must be specified.")
 
+  if not FLAGS.eval_file:
+    raise ValueError(
+        "`eval_file` must be specified.")
+
   if FLAGS.max_seq_length > bert_config.max_position_embeddings:
     raise ValueError(
         "Cannot use sequence length %d because the BERT model "
@@ -613,22 +633,6 @@ def main(_):
   tokenizer = tokenization.FullTokenizer(
       vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
 
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
-      model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
-
   train_examples = None
   num_train_steps = None
   num_warmup_steps = None
@@ -636,8 +640,13 @@ def main(_):
   train_examples = read_open_qa_examples(
       inputfile=FLAGS.train_file, is_training=True)
   num_train_steps = int(
-      len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
+      len(train_examples) / FLAGS.num_gpus / FLAGS.train_batch_size)
   num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
+
+  eval_examples = read_open_qa_examples(
+      inputfile=FLAGS.eval_file, is_training=True)
+  num_eval_steps = int(
+      len(eval_examples) / FLAGS.num_gpus / FLAGS.train_batch_size)
 
   # Pre-shuffle the input to avoid having to make a very large shuffle
   # buffer in in the `input_fn`.
@@ -650,24 +659,16 @@ def main(_):
       learning_rate=FLAGS.learning_rate,
       num_train_steps=num_train_steps,
       num_warmup_steps=num_warmup_steps,
-      use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+      num_gpus=FLAGS.num_gpus,
+      is_training=True)
 
-  # If TPU is not available, this will fall back to normal Estimator on CPU
-  # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
-      model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      predict_batch_size=FLAGS.predict_batch_size)
-
-  filename = os.path.join(FLAGS.output_dir, "train.tf_record")
-  if True: # not os.path.exists(filename):
+  train_filename = os.path.join(FLAGS.output_dir, "train.tf_record")
+  eval_filename = os.path.join(FLAGS.output_dir, "dev.tf_record")
+  if not os.path.exists(train_filename): # TODO:
     # We write to a temporary file to avoid storing very large constant tensors
     # in memory.
     train_writer = FeatureWriter(
-        filename=filename,
+        filename=train_filename,
         is_training=True,
         max_seq_length=FLAGS.max_seq_length)
     convert_examples_to_features(
@@ -679,19 +680,96 @@ def main(_):
         output_fn=train_writer.process_feature)
     train_writer.close()
 
+    eval_writer = FeatureWriter(
+        filename=eval_filename,
+        is_training=True,
+        max_seq_length=FLAGS.max_seq_length)
+    convert_examples_to_features(
+        examples=eval_examples,
+        tokenizer=tokenizer,
+        max_seq_length=FLAGS.max_seq_length,
+        max_query_length=FLAGS.max_query_length,
+        is_training=True,
+        output_fn=eval_writer.process_feature)
+    eval_writer.close()
+
     tf.logging.info("***** Running training *****")
-    tf.logging.info("  Num orig examples = %d", len(train_examples))
-    tf.logging.info("  Num split examples = %d", train_writer.num_features)
+    tf.logging.info("  Num orig train examples = %d", len(train_examples))
+    tf.logging.info("  Num split train examples = %d", train_writer.num_features)
+    tf.logging.info("  Num orig eval examples = %d", len(eval_examples))
+    tf.logging.info("  Num split eval examples = %d", eval_writer.num_features)
     tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
     tf.logging.info("  Num steps = %d", num_train_steps)
-    del train_examples
+    del train_examples, eval_examples
 
   train_input_fn = input_fn_builder(
-      input_file=filename,
+      input_file=train_filename,
       seq_length=FLAGS.max_seq_length,
       is_training=True,
       drop_remainder=True)
-  estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
+  train_dataset = train_input_fn({"batch_size":FLAGS.train_batch_size, "num_gpus":FLAGS.num_gpus})
+  input_data = train_dataset.make_one_shot_iterator()
+  train_op, loss = model_fn(input_data)
+
+  eval_input_fn = input_fn_builder(
+      input_file=eval_filename,
+      seq_length=FLAGS.max_seq_length,
+      is_training=False,
+      drop_remainder=True)
+  eval_dataset = eval_input_fn({"batch_size":FLAGS.train_batch_size, "num_gpus":FLAGS.num_gpus})
+  eval_input_data = eval_dataset.make_one_shot_iterator()
+  _, eval_loss = model_fn(eval_input_data)
+
+  saver = tf.train.Saver(max_to_keep=5)
+  best_eval_loss = float("inf")
+  current_batch_losses = []
+  with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as sess:
+    init = tf.global_variables_initializer()
+    sess.run(init)
+
+    batch_time = 0
+    on_step = 0
+    for epoch in range(FLAGS.num_train_epochs):
+      for i in range(num_train_steps):
+        t0 = time.perf_counter()
+        _, batch_loss = sess.run([train_op, loss])
+        current_batch_losses.append(batch_loss)
+        on_step += 1
+
+        if np.isnan(batch_loss):
+          raise RuntimeError("NaN loss!")
+
+        batch_time += time.perf_counter() - t0
+
+        if on_step % FLAGS.log_steps == 0:
+            print("on epoch=%d batch=%d step=%d time=%.3f" %
+                (epoch, i + 1, on_step, batch_time))
+            batch_time = 0
+
+        # occasional saving
+        if on_step % FLAGS.save_checkpoints_steps == 0:
+          print("Checkpointing:", on_step)
+          print("loss:", np.mean(current_batch_losses))
+          current_batch_losses = []
+          saver.save(sess, os.path.join(FLAGS.output_dir, "checkpoint-" + str(on_step)))
+
+        # Occasional evaluation
+        if on_step % FLAGS.eval_steps == 0:
+          print("Running evaluation...")
+          all_eval_losses = []
+          t0 = time.perf_counter()
+          for j in range(num_eval_steps):
+            batch_loss = sess.run([eval_loss])
+            all_eval_losses.append(batch_loss)
+          print("Evaluation took: %.3f seconds" % (time.perf_counter() - t0))
+          average_eval_loss = np.mean(all_eval_losses)
+          if average_eval_loss < best_eval_loss:
+            print("Best model ever since, %f vs %f" % (average_eval_loss, best_eval_loss))
+            best_eval_loss = average_eval_loss
+            saver.save(sess, os.path.join(FLAGS.output_dir, "best"))
+
+    sess.close()
+
 
 
 if __name__ == "__main__":

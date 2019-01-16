@@ -22,7 +22,7 @@ import re
 import tensorflow as tf
 
 
-def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
+def create_optimizer(init_lr, num_train_steps, num_warmup_steps): # TODO: loss
   """Creates an optimizer training op."""
   global_step = tf.train.get_or_create_global_step()
 
@@ -64,6 +64,9 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
       epsilon=1e-6,
       exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
 
+  return optimizer, global_step
+
+  """
   if use_tpu:
     optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
@@ -79,6 +82,7 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
   new_global_step = global_step + 1
   train_op = tf.group(train_op, [global_step.assign(new_global_step)])
   return train_op
+  """
 
 
 class AdamWeightDecayOptimizer(tf.train.Optimizer):
