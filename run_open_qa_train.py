@@ -629,6 +629,7 @@ def main(_):
   validate_flags_or_throw(bert_config)
 
   tf.gfile.MakeDirs(FLAGS.output_dir)
+  tf.gfile.MakeDirs(os.path.join(FLAGS.output_dir, "best_model"))
 
   tokenizer = tokenization.FullTokenizer(
       vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
@@ -721,6 +722,7 @@ def main(_):
   _, eval_loss = model_fn(eval_input_data)
 
   saver = tf.train.Saver(max_to_keep=5)
+  best_saver = tf.train.Saver(max_to_keep=1)
   best_eval_loss = float("inf")
   current_batch_losses = []
   with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as sess:
@@ -766,7 +768,7 @@ def main(_):
           if average_eval_loss < best_eval_loss:
             print("Best model ever since, %f vs %f" % (average_eval_loss, best_eval_loss))
             best_eval_loss = average_eval_loss
-            saver.save(sess, os.path.join(FLAGS.output_dir, "best"))
+            best_saver.save(sess, os.path.join(FLAGS.output_dir, "best_model", "best"))
 
     sess.close()
 
