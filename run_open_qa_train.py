@@ -408,7 +408,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
   def model_fn(input_data):  # pylint: disable=unused-argument
     """The `model_fn` for TPUEstimator."""
 
-    optimizer, global_step = optimization.create_optimizer(
+    optimizer, global_step, learning_rate = optimization.create_optimizer(
         learning_rate, num_train_steps, num_warmup_steps)
 
     tower_grads = []
@@ -459,7 +459,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                   positions, depth=seq_length, dtype=tf.float32)
               b = tf.expand_dims(weights, -1)
               c = tf.multiply(a, b)
-              d = tf.reduce_sum(c, 1) / tf.expand_dims(tf.reduce_sum(weights, -1), -1) # TODO:
+              d = tf.reduce_sum(c, 1) # / tf.expand_dims(tf.reduce_sum(weights, -1), -1) # TODO:
               log_probs = tf.nn.log_softmax(logits, axis=-1)
               loss = -tf.reduce_mean(
                   tf.reduce_sum(d * log_probs, axis=-1))
@@ -494,7 +494,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
       new_global_step = global_step + 1
       train_op = tf.group(train_op, [global_step.assign(new_global_step)])
 
-    return train_op, tf.reduce_mean(losses)
+    return train_op, tf.reduce_mean(losses), global_step, learning_rate
 
   return model_fn
 
@@ -640,6 +640,7 @@ def main(_):
 
   train_examples = read_open_qa_examples(
       inputfile=FLAGS.train_file, is_training=True)
+
   num_train_steps = int(
       len(train_examples) / FLAGS.num_gpus / FLAGS.train_batch_size)
   num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
@@ -710,7 +711,7 @@ def main(_):
       drop_remainder=True)
   train_dataset = train_input_fn({"batch_size":FLAGS.train_batch_size, "num_gpus":FLAGS.num_gpus})
   input_data = train_dataset.make_one_shot_iterator()
-  train_op, loss = model_fn(input_data)
+  train_op, loss, global_step, lr = model_fn(input_data)
 
   eval_input_fn = input_fn_builder(
       input_file=eval_filename,
@@ -719,7 +720,7 @@ def main(_):
       drop_remainder=True)
   eval_dataset = eval_input_fn({"batch_size":FLAGS.train_batch_size, "num_gpus":FLAGS.num_gpus})
   eval_input_data = eval_dataset.make_one_shot_iterator()
-  _, eval_loss = model_fn(eval_input_data)
+  _, eval_loss, _, _ = model_fn(eval_input_data)
 
   saver = tf.train.Saver(max_to_keep=5)
   best_saver = tf.train.Saver(max_to_keep=1)
@@ -734,9 +735,9 @@ def main(_):
     for epoch in range(FLAGS.num_train_epochs):
       for i in range(num_train_steps):
         t0 = time.perf_counter()
-        _, batch_loss = sess.run([train_op, loss])
+        _, batch_loss, on_step, current_lr = sess.run([train_op, loss, global_step, lr])
+        on_step = on_step + 1
         current_batch_losses.append(batch_loss)
-        on_step += 1
 
         if np.isnan(batch_loss):
           raise RuntimeError("NaN loss!")
@@ -744,15 +745,14 @@ def main(_):
         batch_time += time.perf_counter() - t0
 
         if on_step % FLAGS.log_steps == 0:
-            print("on epoch=%d batch=%d step=%d time=%.3f" %
-                (epoch, i + 1, on_step, batch_time))
+            print("on epoch=%d batch=%d step=%d time=%.3f loss=%.3f lr=%.3f" %
+                (epoch, i + 1, on_step, batch_time, np.mean(current_batch_losses), current_lr))
+            current_batch_losses = []
             batch_time = 0
 
         # occasional saving
         if on_step % FLAGS.save_checkpoints_steps == 0:
           print("Checkpointing:", on_step)
-          print("loss:", np.mean(current_batch_losses))
-          current_batch_losses = []
           saver.save(sess, os.path.join(FLAGS.output_dir, "checkpoint-" + str(on_step)))
 
         # Occasional evaluation
@@ -765,8 +765,9 @@ def main(_):
             all_eval_losses.append(batch_loss)
           print("Evaluation took: %.3f seconds" % (time.perf_counter() - t0))
           average_eval_loss = np.mean(all_eval_losses)
+          print("Eval loss: %f, Best eval loss: %f" % (average_eval_loss, best_eval_loss))
           if average_eval_loss < best_eval_loss:
-            print("Best model ever since, %f vs %f" % (average_eval_loss, best_eval_loss))
+            print("Best model ever since")
             best_eval_loss = average_eval_loss
             best_saver.save(sess, os.path.join(FLAGS.output_dir, "best_model", "best"))
 
@@ -779,3 +780,4 @@ if __name__ == "__main__":
   flags.mark_flag_as_required("bert_config_file")
   flags.mark_flag_as_required("output_dir")
   tf.app.run()
+

@@ -64,7 +64,7 @@ def create_optimizer(init_lr, num_train_steps, num_warmup_steps): # TODO: loss
       epsilon=1e-6,
       exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
 
-  return optimizer, global_step
+  return optimizer, global_step, learning_rate
 
   """
   if use_tpu:
