@@ -616,11 +616,17 @@ def main(_):
       train_batch_size=FLAGS.predict_batch_size,
       predict_batch_size=FLAGS.predict_batch_size)
 
+  filename = os.path.basename(FLAGS.predict_file)
+  eval_set = filename.split("_")[0]
+  eval_lang = "-".join(filename.split("_")[2:-1])
+  n_para = filename.split("_")[-1].split(".")[0]
+
   eval_examples = read_open_qa_test_examples(
       inputfile=FLAGS.predict_file)
 
+  eval_tf_record_name = "%s-%s-%s.tf_record" % (eval_set, eval_lang, n_para)
   eval_writer = FeatureWriter(
-      filename=os.path.join(FLAGS.model_dir, "eval.tf_record"))
+      filename=os.path.join(FLAGS.model_dir, eval_tf_record_name))
   eval_features = []
 
   def append_feature(feature):
@@ -663,8 +669,10 @@ def main(_):
             start_logits=start_logits,
             end_logits=end_logits))
 
-  question_prediction_file = os.path.join(FLAGS.model_dir, "question-output.txt")
-  paragraph_prediction_file = os.path.join(FLAGS.model_dir, "paragraph-output.txt")
+  question_prediction_file = "%s-question-%s-%s-output.txt" % (eval_set, eval_lang, n_para)
+  paragraph_prediction_file = "%s-paragraph-%s-%s-output.txt" % (eval_set, eval_lang, n_para)
+  question_prediction_file = os.path.join(FLAGS.model_dir, question_prediction_file)
+  paragraph_prediction_file = os.path.join(FLAGS.model_dir, paragraph_prediction_file)
 
   """
   import pickle

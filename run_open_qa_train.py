@@ -408,7 +408,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
   def model_fn(input_data):  # pylint: disable=unused-argument
     """The `model_fn` for TPUEstimator."""
 
-    optimizer, global_step, learning_rate = optimization.create_optimizer(
+    optimizer, global_step, current_lr = optimization.create_optimizer(
         learning_rate, num_train_steps, num_warmup_steps)
 
     tower_grads = []
@@ -494,7 +494,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
       new_global_step = global_step + 1
       train_op = tf.group(train_op, [global_step.assign(new_global_step)])
 
-    return train_op, tf.reduce_mean(losses), global_step, learning_rate
+    return train_op, tf.reduce_mean(losses), global_step, current_lr
 
   return model_fn
 
@@ -745,7 +745,7 @@ def main(_):
         batch_time += time.perf_counter() - t0
 
         if on_step % FLAGS.log_steps == 0:
-            print("on epoch=%d batch=%d step=%d time=%.3f loss=%.3f lr=%.3f" %
+            print("on epoch=%d batch=%d step=%d time=%.3f loss=%.3f lr=%.6f" %
                 (epoch, i + 1, on_step, batch_time, np.mean(current_batch_losses), current_lr))
             current_batch_losses = []
             batch_time = 0
