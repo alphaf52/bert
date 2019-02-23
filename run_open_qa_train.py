@@ -155,7 +155,11 @@ def read_open_qa_examples(inputfile, is_training):
     for line in fin:
       item = json.loads(line.strip())
       qid = item["question_id"]
-      question_text = " ".join(item["question"])
+      # EN
+      question_text = " ".join(item["question"]).replace("< Query >", "%q")
+      # Chinese:
+      # question_text = "".join(item["question"]).replace("<Query>", "%q")
+
       doc_tokens = item["context"]
       orig_answer_text = item["answer_text"]
       start_positions = [[answer_span[0] for answer_span in x] for x in item["answer_spans"]]
@@ -204,10 +208,9 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
         for (j, token) in enumerate(example.doc_tokens[i]):
           orig_to_tok_index.append(len(all_doc_tokens))
           # TODO:
-          token = token.replace("QQQQQQ", "%Q")
-          token = token.replace("%%DOCUMENT%%", "%D")
-          token = token.replace("%%PARAGRAPH%%", "%P")
-          token = token.replace("%%PARAGRAPH_GROUP%%", "%G")
+          token = token.replace("%%DOCUMENT%%", "%d")
+          token = token.replace("%%PARAGRAPH%%", "%p")
+          token = token.replace("%%PARAGRAPH_GROUP%%", "%g")
           sub_tokens = tokenizer.tokenize(token)
           """
           if not token in set(["%%DOCUMENT%%", "%%PARAGRAPH%%", "%%PARAGRAPH_GROUP%%"]):

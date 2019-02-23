@@ -150,7 +150,11 @@ def read_open_qa_test_examples(inputfile):
       item = json.loads(line.strip())
       qid = item["question_id"]
       docid = item["doc_id"]
-      question_text = " ".join(item["question"])
+      # EN
+      question_text = " ".join(item["question"]).replace("< Query >", "%q")
+      # Chinese:
+      # question_text = "".join(item["question"]).replace("<Query>", "%q")
+
       doc_tokens = item["context"]
       orig_answer_text = item["answer_text"]
       example = OpenQATestExample(
@@ -189,10 +193,9 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
     for (i, token) in enumerate(example.doc_tokens):
       orig_to_tok_index.append(len(all_doc_tokens))
       # TODO:
-      token = token.replace("QQQQQQ", "%Q")
-      token = token.replace("%%DOCUMENT%%", "%D")
-      token = token.replace("%%PARAGRAPH%%", "%P")
-      token = token.replace("%%PARAGRAPH_GROUP%%", "%G")
+      token = token.replace("%%DOCUMENT%%", "%d")
+      token = token.replace("%%PARAGRAPH%%", "%p")
+      token = token.replace("%%PARAGRAPH_GROUP%%", "%g")
       sub_tokens = tokenizer.tokenize(token)
       """
       if not token in set(["%%DOCUMENT%%", "%%PARAGRAPH%%", "%%PARAGRAPH_GROUP%%"]):
